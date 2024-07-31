@@ -18,7 +18,7 @@ from torch.optim.lr_scheduler import LambdaLR
 from helpers import quat_mult, weighted_l2_loss_v2
 from external import calc_ssim, build_rotation
 
-T = 10
+T = 5
 
 def get_dataset(t, md, seq):
     dataset = []
@@ -300,10 +300,10 @@ def train(seq: str):
     params = load_params('params.pth')
     variables = init_variables(params)
     
-    mlp = MLP(95, 256, seq_len, 6).cuda()
-    mlp_optimizer = torch.optim.Adam(params=mlp.parameters(), lr=1e-3)
+    mlp = MLP(95, 128, seq_len, 6).cuda()
+    mlp_optimizer = torch.optim.Adam(params=mlp.parameters(), lr=4e-3)
 
-    iterations = 10_000
+    iterations = 20_000
 
     means = params['means']
     rotations = params['rotations']
@@ -390,11 +390,10 @@ def train(seq: str):
             X = das[0]
 
             # delta = mlp(torch.cat((params['means'], params['rotations']), dim=1), torch.tensor(t).cuda())
-            delta = mlp(torch.cat((params['means'], params['rotations']), dim=1), torch.cat((means_norm, rotations_norm), dim=1), torch.tensor(di).cuda())
+            delta = mlp(torch.cat((params['means'], params['rotations']), dim=1), torch.cat((means_norm, rotations_norm), dim=1), torch.tensor(t).cuda())
             delta_means = delta[:,:3]
             delta_rotations = delta[:,3:]
 
-            l = 0.02
             updated_params = copy.deepcopy(params)
             updated_params['means'] = updated_params['means'].detach()
             updated_params['means'] += delta_means * l
@@ -414,7 +413,14 @@ def train(seq: str):
         images[0].save('temp_result.gif', save_all=True,optimize=False, append_images=images[1:], loop=0)
 
 def main():
-    wandb.init(project="new-dynamic-gaussians")
+    wandb.login(
+        key="45f1e71344c1104de0ce98dc2cf5d9e7557e88ea"
+    )
+    wandb.init(
+        project="new-dynamic-gaussians",
+        entity="myasincifci",
+
+    )
 
     train('basketball')
 
