@@ -15,10 +15,10 @@ from helpers import o3d_knn, setup_camera
 
 from torch.optim.lr_scheduler import LambdaLR
 
-from helpers import quat_mult, weighted_l2_loss_v2
+from helpers import quat_mult, weighted_l2_loss_v2, l1_loss_v2
 from external import calc_ssim, build_rotation
 
-T = 5
+T = 10
 
 def get_dataset(t, md, seq):
     dataset = []
@@ -70,14 +70,24 @@ def get_loss(params, batch, variables, alpha):
     
     loss_rigid = weighted_l2_loss_v2(curr_offset_in_prev_coord, variables["prev_offset"],
                                             variables["neighbor_weight"])
+
     loss_l1 = torch.nn.functional.l1_loss(im, batch['im'])
+    loss_ssim = (1.0 - calc_ssim(im, batch['im']))
+    loss_im = 0.8*loss_l1 + 0.2*loss_ssim
+
+    bg_pts = rendervar['means3D'][~is_fg]
+    bg_rot = rendervar['rotations'][~is_fg]
+    loss_bg = l1_loss_v2(bg_pts, variables["init_bg_pts"]) + l1_loss_v2(bg_rot, variables["init_bg_rot"])
 
     wandb.log({
             f'loss-l1': loss_l1.item(),
-            f'loss-rigid': loss_rigid.item()
+            f'loss-ssim': loss_ssim.item(),
+            f'loss-image': loss_im.item(),
+            f'loss-rigid': loss_rigid.item(),
+            f'loss-bg': loss_bg.item(),
         })
 
-    return loss_l1 + 4*alpha*loss_rigid
+    return loss_im + 3*alpha*loss_rigid + 20*loss_bg
 
 def init_variables(params, num_knn=20):
     variables = {}
@@ -192,12 +202,12 @@ class ResidualBlock(nn.Module):
 
         x = self.fc1(x)
         x = self.bn1(x)
-        x = nn.functional.relu(x)
+        x = nn.functional.gelu(x)
         x = self.fc2(x)
         x = self.bn2(x)
         
         x += identity
-        x = nn.functional.relu(x)
+        x = nn.functional.gelu(x)
 
         return x
 
@@ -300,7 +310,7 @@ def train(seq: str):
     params = load_params('params.pth')
     variables = init_variables(params)
     
-    mlp = MLP(95, 128, seq_len, 6).cuda()
+    mlp = MLP(95, 128, seq_len, 9).cuda()
     mlp_optimizer = torch.optim.Adam(params=mlp.parameters(), lr=4e-3)
 
     iterations = 20_000
