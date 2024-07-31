@@ -201,20 +201,6 @@ class ResidualBlock(nn.Module):
 
         return x
 
-class PositionalEncoding(nn.Module):
-    def __init__(self, L):
-        super(PositionalEncoding, self).__init__()
-        self.L = L
-        self.consts = ((torch.ones(L)*2).pow(torch.arange(L)) * torch.pi).cuda()
-    
-    def forward(self, x):
-        x = x[:,:,None]
-        A = (self.consts * x).repeat_interleave(2,2)
-        A[:,:,::2] = torch.sin(A[:,:,::2])
-        A[:,:,1::2] = torch.cos(A[:,:,::2])
-
-        return A.permute(0,2,1).flatten(start_dim=1)
-
 class MLP(nn.Module):
     def __init__(self, in_dim, hid_dim, seq_len, block_num) -> None:
         super(MLP, self).__init__()
@@ -232,7 +218,7 @@ class MLP(nn.Module):
         mask = 2 ** torch.arange(bits - 1, -1, -1).to(x.device, x.dtype)
         return x.unsqueeze(-1).bitwise_and(mask).ne(0).float()
 
-    def forward(self, x, t):
+    def forward(self, x, x_, t):
         B, D = x.shape
 
         identity = x
@@ -240,7 +226,7 @@ class MLP(nn.Module):
         e = self.emb(t).repeat(B, 1)
         # e = self.dec2bin(t, 3).repeat(B, 1)
 
-        x = torch.cat((x, e), dim=1)
+        x = torch.cat((x_, e), dim=1)
         # x = x + e
 
         x = self.fc_in(x)
@@ -293,6 +279,20 @@ class UNet(nn.Module):
         x += identity
 
         return x
+    
+class PositionalEncoding(nn.Module):
+    def __init__(self, L):
+        super(PositionalEncoding, self).__init__()
+        self.L = L
+        self.consts = ((torch.ones(L)*2).pow(torch.arange(L)) * torch.pi).cuda()
+    
+    def forward(self, x):
+        x = x[:,:,None]
+        A = (self.consts * x).repeat_interleave(2,2)
+        A[:,:,::2] = torch.sin(A[:,:,::2])
+        A[:,:,1::2] = torch.cos(A[:,:,::2])
+
+        return A.permute(0,2,1).flatten(start_dim=1)
 
 def train(seq: str):
     md = json.load(open(f"./data/{seq}/train_meta.json", 'r'))
@@ -300,10 +300,25 @@ def train(seq: str):
     params = load_params('params.pth')
     variables = init_variables(params)
     
-    mlp = MLP(10, 128, seq_len, 6).cuda()
-    mlp_optimizer = torch.optim.Adam(params=mlp.parameters(), lr=4e-3)
+    mlp = MLP(95, 256, seq_len, 6).cuda()
+    mlp_optimizer = torch.optim.Adam(params=mlp.parameters(), lr=1e-3)
 
-    iterations = 30_000
+    iterations = 10_000
+
+    means = params['means']
+    rotations = params['rotations']
+
+    means_norm = means - means.min(dim=0).values
+    means_norm = (2. * means_norm / means_norm.max(dim=0).values) - 1.
+
+    rotations_norm = rotations - rotations.min(dim=0).values
+    rotations_norm = (2. * rotations_norm / rotations_norm.max(dim=0).values) - 1.
+
+    pos_mean = PositionalEncoding(L=10)
+    pos_smol = PositionalEncoding(L=4)
+
+    means_norm = pos_mean(means_norm)
+    rotations_norm = pos_smol(rotations_norm)
 
     ## Random Training
     dataset = []
@@ -322,7 +337,8 @@ def train(seq: str):
 
         X = dataset[di][si]
 
-        delta = mlp(torch.cat((params['means'], params['rotations']), dim=1), torch.tensor(di).cuda())
+        # delta = mlp(torch.cat((params['means'], params['rotations']), dim=1), torch.tensor(di).cuda())
+        delta = mlp(torch.cat((params['means'], params['rotations']), dim=1), torch.cat((means_norm, rotations_norm), dim=1), torch.tensor(di).cuda())
         delta_means = delta[:,:3]
         delta_rotations = delta[:,3:]
 
@@ -373,7 +389,8 @@ def train(seq: str):
             das = get_dataset(t, md=md, seq='basketball')
             X = das[0]
 
-            delta = mlp(torch.cat((params['means'], params['rotations']), dim=1), torch.tensor(t).cuda())
+            # delta = mlp(torch.cat((params['means'], params['rotations']), dim=1), torch.tensor(t).cuda())
+            delta = mlp(torch.cat((params['means'], params['rotations']), dim=1), torch.cat((means_norm, rotations_norm), dim=1), torch.tensor(di).cuda())
             delta_means = delta[:,:3]
             delta_rotations = delta[:,3:]
 
