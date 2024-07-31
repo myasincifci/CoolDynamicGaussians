@@ -1,3 +1,4 @@
+import math
 import numpy as np
 import torch
 from torch import nn
@@ -13,6 +14,9 @@ from diff_gaussian_rasterization import GaussianRasterizer as Renderer
 from helpers import o3d_knn, setup_camera
 
 from torch.optim.lr_scheduler import LambdaLR
+
+from helpers import quat_mult, weighted_l2_loss_v2
+from external import calc_ssim, build_rotation
 
 T = 10
 
@@ -48,14 +52,73 @@ def params2rendervar(params):
     }
     return rendervar
 
-def get_loss(params, batch):
+def get_loss(params, batch, variables, alpha):
     rendervar = params2rendervar(params)
     # rendervar['means2D'].retain_grad()
 
     im, _, _, = Renderer(raster_settings=batch['cam'])(**rendervar)
-    loss = torch.nn.functional.l1_loss(im, batch['im'])
 
-    return loss
+    is_fg = (params['seg_colors'][:, 0] > 0.5).detach()
+    fg_pts = rendervar['means3D'][is_fg]
+    fg_rot = rendervar['rotations'][is_fg]
+
+    rel_rot = quat_mult(fg_rot, variables["prev_inv_rot_fg"])
+    rot = build_rotation(rel_rot)
+    neighbor_pts = fg_pts[variables["neighbor_indices"]]
+    curr_offset = neighbor_pts - fg_pts[:, None]
+    curr_offset_in_prev_coord = (rot.transpose(2, 1)[:, None] @ curr_offset[:, :, :, None]).squeeze(-1)
+    
+    loss_rigid = weighted_l2_loss_v2(curr_offset_in_prev_coord, variables["prev_offset"],
+                                            variables["neighbor_weight"])
+    loss_l1 = torch.nn.functional.l1_loss(im, batch['im'])
+
+    wandb.log({
+            f'loss-l1': loss_l1.item(),
+            f'loss-rigid': loss_rigid.item()
+        })
+
+    return loss_l1 + 4*alpha*loss_rigid
+
+def init_variables(params, num_knn=20):
+    variables = {}
+
+    is_fg = params['seg_colors'][:, 0] > 0.5
+    init_fg_pts = params['means'][is_fg]
+    init_bg_pts = params['means'][~is_fg]
+    init_bg_rot = torch.nn.functional.normalize(params['rotations'][~is_fg])
+
+    neighbor_sq_dist, neighbor_indices = o3d_knn(init_fg_pts.detach().cpu().numpy(), num_knn)
+    neighbor_weight = np.exp(-2000 * neighbor_sq_dist)
+    neighbor_dist = np.sqrt(neighbor_sq_dist)
+
+    variables["neighbor_indices"] = torch.tensor(neighbor_indices).cuda().long().contiguous()
+    variables["neighbor_weight"] = torch.tensor(neighbor_weight).cuda().float().contiguous()
+    variables["neighbor_dist"] = torch.tensor(neighbor_dist).cuda().float().contiguous()
+
+    variables["init_bg_pts"] = init_bg_pts.detach()
+    variables["init_bg_rot"] = init_bg_rot.detach()
+    variables["prev_pts"] = params['means'].detach()
+    variables["prev_rot"] = torch.nn.functional.normalize(params['rotations']).detach()
+    
+    return variables
+
+def initialize_per_timestep(params, variables):
+    pts = params['means']
+    rot = torch.nn.functional.normalize(params['rotations'])
+
+    is_fg = params['seg_colors'][:, 0] > 0.5
+    prev_inv_rot_fg = rot[is_fg]
+    prev_inv_rot_fg[:, 1:] = -1 * prev_inv_rot_fg[:, 1:]
+    fg_pts = pts[is_fg]
+    prev_offset = fg_pts[variables["neighbor_indices"]] - fg_pts[:, None]
+    
+    variables['prev_inv_rot_fg'] = prev_inv_rot_fg.detach().clone()
+    variables['prev_offset'] = prev_offset.detach().clone()
+    variables["prev_col"] = params['colors'].detach().clone()
+    variables["prev_pts"] = pts.detach().clone()
+    variables["prev_rot"] = rot.detach().clone()
+
+    return variables
 
 def get_frame(params, batch):
     rendervar = params2rendervar(params)
@@ -72,19 +135,97 @@ def load_params(path: str):
 
     return params
 
+# class MLP(nn.Module):
+#     def __init__(self, in_dim, seq_len) -> None:
+#         super(MLP, self).__init__()
+#         self.fc1 = nn.Linear(in_dim + 3, 512)
+#         self.fc2 = nn.Linear(512, 512)
+#         self.fc3 = nn.Linear(512, 512)
+#         self.fc4 = nn.Linear(512, 512)
+#         self.fc5 = nn.Linear(512, 512)
+#         self.fc6 = nn.Linear(512, in_dim)
+
+#         self.relu = nn.ReLU()
+
+#         self.emb = nn.Embedding(seq_len, 3)
+
+#     def dec2bin(self, x, bits):
+#         # mask = 2 ** torch.arange(bits).to(x.device, x.dtype)
+#         mask = 2 ** torch.arange(bits - 1, -1, -1).to(x.device, x.dtype)
+#         return x.unsqueeze(-1).bitwise_and(mask).ne(0).float()
+
+#     def forward(self, x, t):
+#         B, D = x.shape
+
+#         x_ = x
+
+#         e = self.emb(t).repeat(B, 1)
+#         # e = self.dec2bin(t, 3).repeat(B, 1)
+
+#         x = torch.cat((x, e), dim=1)
+#         # x = x + e
+
+#         x = x # + e
+#         x = self.relu(self.fc1(x))
+#         x1 = x
+#         x = self.relu(self.fc2(x))
+#         x2 = x
+#         x = self.relu(self.fc3(x))
+#         x = self.relu(self.fc4(x))
+#         x = x + x2
+#         x = self.relu(self.fc5(x))
+#         x = x + x1
+#         x =           self.fc6(x)
+
+#         return x_ + x
+
+class ResidualBlock(nn.Module):
+    def __init__(self, dim) -> None:
+        super(ResidualBlock, self).__init__()
+        self.fc1 = nn.Linear(dim, dim, bias=False)
+        self.bn1 = nn.BatchNorm1d(dim)
+        self.fc2 = nn.Linear(dim, dim, bias=False)
+        self.bn2 = nn.BatchNorm1d(dim)
+
+    def forward(self, x):
+        identity = x
+
+        x = self.fc1(x)
+        x = self.bn1(x)
+        x = nn.functional.relu(x)
+        x = self.fc2(x)
+        x = self.bn2(x)
+        
+        x += identity
+        x = nn.functional.relu(x)
+
+        return x
+
+class PositionalEncoding(nn.Module):
+    def __init__(self, L):
+        super(PositionalEncoding, self).__init__()
+        self.L = L
+        self.consts = ((torch.ones(L)*2).pow(torch.arange(L)) * torch.pi).cuda()
+    
+    def forward(self, x):
+        x = x[:,:,None]
+        A = (self.consts * x).repeat_interleave(2,2)
+        A[:,:,::2] = torch.sin(A[:,:,::2])
+        A[:,:,1::2] = torch.cos(A[:,:,::2])
+
+        return A.permute(0,2,1).flatten(start_dim=1)
+
 class MLP(nn.Module):
-    def __init__(self, in_dim, seq_len) -> None:
+    def __init__(self, in_dim, hid_dim, seq_len, block_num) -> None:
         super(MLP, self).__init__()
-        self.fc1 = nn.Linear(in_dim + 2, 128)
-        self.fc2 = nn.Linear(128, 512)
-        self.fc3 = nn.Linear(512, 1024)
-        self.fc4 = nn.Linear(1024, 512)
-        self.fc5 = nn.Linear(512, 128)
-        self.fc6 = nn.Linear(128, in_dim)
+        
+        self.fc_in = nn.Linear(in_dim, hid_dim)
+        self.res_blocks = nn.Sequential(
+            *(ResidualBlock(hid_dim) for _ in range(block_num))
+        )
+        self.fc_out = nn.Linear(hid_dim, 7)
 
-        self.relu = nn.ReLU()
-
-        self.emb = nn.Embedding(seq_len, 2)
+        self.emb = nn.Embedding(seq_len, 3)
 
     def dec2bin(self, x, bits):
         # mask = 2 ** torch.arange(bits).to(x.device, x.dtype)
@@ -94,86 +235,91 @@ class MLP(nn.Module):
     def forward(self, x, t):
         B, D = x.shape
 
-        x_ = x
+        identity = x
 
         e = self.emb(t).repeat(B, 1)
         # e = self.dec2bin(t, 3).repeat(B, 1)
 
         x = torch.cat((x, e), dim=1)
+        # x = x + e
 
-        x = x # + e
-        x = self.relu(self.fc1(x))
-        x1 = x
-        x = self.relu(self.fc2(x))
-        x2 = x
-        x = self.relu(self.fc3(x))
-        x = self.relu(self.fc4(x))
-        x = x + x2
-        x = self.relu(self.fc5(x))
-        x = x + x1
-        x =           self.fc6(x)
+        x = self.fc_in(x)
+        x = self.res_blocks(x)
+        x = self.fc_out(x)
 
-        return x_ + x
+        x += identity
+
+        return x
+
+class UNet(nn.Module):
+    def __init__(self, in_dim, hid_dim, seq_len, block_num) -> None:
+        super(UNet, self).__init__()
+        
+        self.fc_in = nn.Linear(in_dim, 512)
+        self.fc_1  = nn.Linear(512, 256)
+        self.fc_2  = nn.Linear(256, 128)
+        self.fc_3  = nn.Linear(128, 64)
+        self.fc_4  = nn.Linear(64, 128)
+        self.fc_5  = nn.Linear(128, 256)
+        self.fc_6  = nn.Linear(256, 512)
+        self.fc_out = nn.Linear(512, 7)
+
+        self.emb = nn.Embedding(seq_len, 3)
+
+    def dec2bin(self, x, bits):
+        # mask = 2 ** torch.arange(bits).to(x.device, x.dtype)
+        mask = 2 ** torch.arange(bits - 1, -1, -1).to(x.device, x.dtype)
+        return x.unsqueeze(-1).bitwise_and(mask).ne(0).float()
+
+    def forward(self, x, t):
+        B, D = x.shape
+
+        identity = x
+
+        e = self.emb(t).repeat(B, 1)
+        # e = self.dec2bin(t, 3).repeat(B, 1)
+
+        x = torch.cat((x, e), dim=1)
+        
+        x = nn.functional.relu(self.fc_in(x))
+        x = nn.functional.relu(self.fc_1(x))
+        x = nn.functional.relu(self.fc_2(x))
+        x = nn.functional.relu(self.fc_3(x))
+        x = nn.functional.relu(self.fc_4(x))
+        x = nn.functional.relu(self.fc_5(x))
+        x = nn.functional.relu(self.fc_6(x))
+        x = nn.functional.relu(self.fc_out(x))
+
+        x += identity
+
+        return x
 
 def train(seq: str):
     md = json.load(open(f"./data/{seq}/train_meta.json", 'r'))
     seq_len = T # len(md['fn'])
     params = load_params('params.pth')
+    variables = init_variables(params)
     
-    mlp = MLP(7, seq_len).cuda()
-    mlp_optimizer = torch.optim.Adam(params=mlp.parameters(), lr=1e-3)
+    mlp = MLP(10, 128, seq_len, 6).cuda()
+    mlp_optimizer = torch.optim.Adam(params=mlp.parameters(), lr=4e-3)
 
-    # ## Initial Training
-
-    # for t in range(0, seq_len , 1):
-    #     dataset = get_dataset(t, md, seq)
-    #     dataset_queue = []
-
-    #     for i in tqdm(range(1_000)):
-    #         X = get_batch(dataset_queue, dataset)
-
-    #         delta = mlp(torch.cat((params['means'], params['rotations']), dim=1), torch.tensor(t).cuda())
-    #         delta_means = delta[:,:3]
-    #         delta_rotations = delta[:,3:]
-
-    #         l = 0.01
-    #         updated_params = copy.deepcopy(params)
-    #         updated_params['means'] = updated_params['means'].detach()
-    #         updated_params['means'] += delta_means * l
-    #         updated_params['rotations'] = updated_params['rotations'].detach()
-    #         updated_params['rotations'] += delta_rotations * l
-
-    #         loss = get_loss(updated_params, X)
-
-    #         wandb.log({
-    #             f'loss-{t}': loss.item(),
-    #         })
-
-    #         loss.backward()
-
-    #         mlp_optimizer.step()
-    #         mlp_optimizer.zero_grad()
-
-    #     dataset_queue = dataset.copy()
-    #     losses = []
-    #     while dataset_queue:
-    #         with torch.no_grad():
-    #             X = get_batch(dataset_queue, dataset)
-
-    #             loss = get_loss(updated_params, X)
-    #             losses.append(loss.item())
-
-    #     wandb.log({
-    #         f'mean-losses': sum(losses) / len(losses)
-    #     })
+    iterations = 30_000
 
     ## Random Training
     dataset = []
     for t in range(1, seq_len + 1, 1):
         dataset += [get_dataset(t, md, seq)]
-    for i in tqdm(range(20_000)):
-        di = torch.randint(0, len(dataset), (1,))
+    for i in tqdm(range(iterations)):
+        p = i / iterations
+        alpha = 2. / (1. + math.exp(-10 * p)) - 1
+
+        di = (i % seq_len)# torch.randint(0, len(dataset), (1,))
         si = torch.randint(0, len(dataset[0]), (1,))
+
+        if di == 0:
+            variables = initialize_per_timestep(params, variables)
+
+
         X = dataset[di][si]
 
         delta = mlp(torch.cat((params['means'], params['rotations']), dim=1), torch.tensor(di).cuda())
@@ -187,7 +333,9 @@ def train(seq: str):
         updated_params['rotations'] = updated_params['rotations'].detach()
         updated_params['rotations'] += delta_rotations * l
 
-        loss = get_loss(updated_params, X)
+        loss = get_loss(updated_params, X, variables, alpha)
+
+        variables = initialize_per_timestep(updated_params, variables) # sets previous state to updated state
 
         wandb.log({
             f'loss-random': loss.item(),
@@ -202,7 +350,7 @@ def train(seq: str):
         losses = []
         with torch.no_grad():
             for X in d:
-                loss = get_loss(updated_params, X)
+                loss = get_loss(updated_params, X, variables, alpha=1.)
                 losses.append(loss.item())
 
         wandb.log({
@@ -229,7 +377,7 @@ def train(seq: str):
             delta_means = delta[:,:3]
             delta_rotations = delta[:,3:]
 
-            l = 0.01
+            l = 0.02
             updated_params = copy.deepcopy(params)
             updated_params['means'] = updated_params['means'].detach()
             updated_params['means'] += delta_means * l
