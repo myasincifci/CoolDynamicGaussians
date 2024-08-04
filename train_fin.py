@@ -18,7 +18,9 @@ from torch.optim.lr_scheduler import LambdaLR
 from helpers import quat_mult, weighted_l2_loss_v2, l1_loss_v2
 from external import calc_ssim, build_rotation
 
-T = 10
+from torch.optim.lr_scheduler import LinearLR, CosineAnnealingLR, SequentialLR
+
+T = 20
 
 def get_dataset(t, md, seq):
     dataset = []
@@ -87,7 +89,7 @@ def get_loss(params, batch, variables, alpha):
             f'loss-bg': loss_bg.item(),
         })
 
-    return loss_im + 3*alpha*loss_rigid + 20*loss_bg
+    return loss_im + 3*alpha*loss_rigid + 0*loss_bg
 
 def init_variables(params, num_knn=20):
     variables = {}
@@ -233,10 +235,10 @@ class MLP(nn.Module):
 
         identity = x
 
-        e = self.emb(t).repeat(B, 1)
+        # e = self.emb(t).repeat(B, 1)
         # e = self.dec2bin(t, 3).repeat(B, 1)
 
-        x = torch.cat((x_, e), dim=1)
+        x = torch.cat((x_, t), dim=1)
         # x = x + e
 
         x = self.fc_in(x)
@@ -267,24 +269,31 @@ class UNet(nn.Module):
         mask = 2 ** torch.arange(bits - 1, -1, -1).to(x.device, x.dtype)
         return x.unsqueeze(-1).bitwise_and(mask).ne(0).float()
 
-    def forward(self, x, t):
+    def forward(self, x, x_, t):
         B, D = x.shape
 
         identity = x
 
-        e = self.emb(t).repeat(B, 1)
+        # e = self.emb(t).repeat(B, 1)
         # e = self.dec2bin(t, 3).repeat(B, 1)
 
-        x = torch.cat((x, e), dim=1)
+        # x = torch.cat((x, e), dim=1)
+        x = torch.cat((x_, t), dim=1)
         
-        x = nn.functional.relu(self.fc_in(x))
-        x = nn.functional.relu(self.fc_1(x))
-        x = nn.functional.relu(self.fc_2(x))
-        x = nn.functional.relu(self.fc_3(x))
-        x = nn.functional.relu(self.fc_4(x))
-        x = nn.functional.relu(self.fc_5(x))
-        x = nn.functional.relu(self.fc_6(x))
-        x = nn.functional.relu(self.fc_out(x))
+        x = nn.functional.gelu(self.fc_in(x))
+        x_1 = x # 512
+        x = nn.functional.gelu(self.fc_1(x))
+        x_2 = x # 256
+        x = nn.functional.gelu(self.fc_2(x))
+        x_3 = x # 128
+        x = nn.functional.gelu(self.fc_3(x))
+        x = nn.functional.gelu(self.fc_4(x))
+        x = x + x_3# 128
+        x = nn.functional.gelu(self.fc_5(x))
+        x = x + x_2
+        x = nn.functional.gelu(self.fc_6(x))
+        x = x + x_1
+        x = nn.functional.gelu(self.fc_out(x))
 
         x += identity
 
@@ -304,16 +313,25 @@ class PositionalEncoding(nn.Module):
 
         return A.permute(0,2,1).flatten(start_dim=1)
 
+def get_linear_warmup_cos_annealing(optimizer, warmup_iters, total_iters):
+        scheduler_warmup = LinearLR(optimizer, start_factor=1/1000, total_iters=warmup_iters)
+        scheduler_cos_decay = CosineAnnealingLR(optimizer, T_max=total_iters-warmup_iters)
+        scheduler = SequentialLR(optimizer, schedulers=[scheduler_warmup, 
+                                    scheduler_cos_decay], milestones=[warmup_iters])
+
+        return scheduler
+
 def train(seq: str):
     md = json.load(open(f"./data/{seq}/train_meta.json", 'r'))
     seq_len = T # len(md['fn'])
     params = load_params('params.pth')
     variables = init_variables(params)
-    
-    mlp = MLP(95, 128, seq_len, 9).cuda()
-    mlp_optimizer = torch.optim.Adam(params=mlp.parameters(), lr=4e-3)
+    iterations = 500_000
 
-    iterations = 20_000
+    mlp = MLP(100, 128, seq_len, 6).cuda()
+    # mlp = UNet(100, None, seq_len, None).cuda()
+    mlp_optimizer = torch.optim.Adam(params=mlp.parameters(), lr=2e-3)
+    scheduler = get_linear_warmup_cos_annealing(mlp_optimizer, warmup_iters=10_000, total_iters=iterations)
 
     means = params['means']
     rotations = params['rotations']
@@ -336,19 +354,20 @@ def train(seq: str):
         dataset += [get_dataset(t, md, seq)]
     for i in tqdm(range(iterations)):
         p = i / iterations
-        alpha = 2. / (1. + math.exp(-10 * p)) - 1
+        alpha = 2. / (1. + math.exp(-6 * p)) - 1
 
         di = (i % seq_len)# torch.randint(0, len(dataset), (1,))
         si = torch.randint(0, len(dataset[0]), (1,))
 
+        t = pos_smol(torch.tensor((di+1)/seq_len).view(1,1).repeat(means_norm.shape[0], 1).cuda())
+
         if di == 0:
             variables = initialize_per_timestep(params, variables)
-
 
         X = dataset[di][si]
 
         # delta = mlp(torch.cat((params['means'], params['rotations']), dim=1), torch.tensor(di).cuda())
-        delta = mlp(torch.cat((params['means'], params['rotations']), dim=1), torch.cat((means_norm, rotations_norm), dim=1), torch.tensor(di).cuda())
+        delta = mlp(torch.cat((params['means'], params['rotations']), dim=1), torch.cat((means_norm, rotations_norm), dim=1), torch.tensor(t).cuda())
         delta_means = delta[:,:3]
         delta_rotations = delta[:,3:]
 
@@ -365,11 +384,13 @@ def train(seq: str):
 
         wandb.log({
             f'loss-random': loss.item(),
+            f'lr': mlp_optimizer.param_groups[0]['lr']
         })
 
         loss.backward()
 
         mlp_optimizer.step()
+        scheduler.step()
         mlp_optimizer.zero_grad()
 
     for d in dataset:
@@ -399,8 +420,10 @@ def train(seq: str):
             das = get_dataset(t, md=md, seq='basketball')
             X = das[0]
 
+            t = pos_smol(torch.tensor((t+1)/seq_len).view(1,1).repeat(means_norm.shape[0], 1).cuda())
+
             # delta = mlp(torch.cat((params['means'], params['rotations']), dim=1), torch.tensor(t).cuda())
-            delta = mlp(torch.cat((params['means'], params['rotations']), dim=1), torch.cat((means_norm, rotations_norm), dim=1), torch.tensor(t).cuda())
+            delta = mlp(torch.cat((params['means'], params['rotations']), dim=1), torch.cat((means_norm, rotations_norm), dim=1), t)
             delta_means = delta[:,:3]
             delta_rotations = delta[:,3:]
 
