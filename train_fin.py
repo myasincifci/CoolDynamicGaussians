@@ -20,7 +20,9 @@ from external import calc_ssim, build_rotation
 
 from torch.optim.lr_scheduler import LinearLR, CosineAnnealingLR, SequentialLR
 
-T = 20
+import sys
+
+# T = 100
 
 def get_dataset(t, md, seq):
     dataset = []
@@ -321,17 +323,17 @@ def get_linear_warmup_cos_annealing(optimizer, warmup_iters, total_iters):
 
         return scheduler
 
-def train(seq: str):
+def train(seq: str, iterations, lr, init_cloud, T):
     md = json.load(open(f"./data/{seq}/train_meta.json", 'r'))
     seq_len = T # len(md['fn'])
-    params = load_params('params.pth')
+    params = load_params(init_cloud)
     variables = init_variables(params)
-    iterations = 500_000
+    iterations = iterations #200_000
 
     mlp = MLP(100, 128, seq_len, 6).cuda()
     # mlp = UNet(100, None, seq_len, None).cuda()
-    mlp_optimizer = torch.optim.Adam(params=mlp.parameters(), lr=2e-3)
-    scheduler = get_linear_warmup_cos_annealing(mlp_optimizer, warmup_iters=10_000, total_iters=iterations)
+    mlp_optimizer = torch.optim.Adam(params=mlp.parameters(), lr=lr)
+    scheduler = get_linear_warmup_cos_annealing(mlp_optimizer, warmup_iters=15_000, total_iters=iterations)
 
     means = params['means']
     rotations = params['rotations']
@@ -406,7 +408,7 @@ def train(seq: str):
 
         ## Visualize
     with torch.no_grad():
-        ds = get_dataset(0, md=md, seq='basketball')
+        ds = get_dataset(0, md=md, seq=seq)
         canon_batch = ds[0]
 
         frames = []
@@ -417,7 +419,7 @@ def train(seq: str):
         frames.append(get_frame(params, canon_batch))
 
         for t in range(0, seq_len , 1):
-            das = get_dataset(t, md=md, seq='basketball')
+            das = get_dataset(t, md=md, seq=seq)
             X = das[0]
 
             t = pos_smol(torch.tensor((t+1)/seq_len).view(1,1).repeat(means_norm.shape[0], 1).cuda())
@@ -445,7 +447,13 @@ def train(seq: str):
         print('Writing image...')
         images[0].save('temp_result.gif', save_all=True,optimize=False, append_images=images[1:], loop=0)
 
+        print('Saving model...')
+        torch.save(mlp.state_dict(), 'model_final.pth')
+
+
 def main():
+    torch.manual_seed(42)
+
     wandb.login(
         key="45f1e71344c1104de0ce98dc2cf5d9e7557e88ea"
     )
@@ -455,7 +463,13 @@ def main():
 
     )
 
-    train('basketball')
+    sequence = sys.argv[1]
+    iterations = int(sys.argv[2])
+    lr = float(sys.argv[3])
+    init_cloud = sys.argv[4]
+    T = int(sys.argv[5])
+
+    train(sequence, iterations, lr, init_cloud, T)
 
 if __name__ == '__main__':
     main()

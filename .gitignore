@@ -3,3 +3,7 @@ __pycache__/
 data/
 output/
 wandb
+
+data_old/
+data.zip
+*.pth
