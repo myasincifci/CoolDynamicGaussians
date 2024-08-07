@@ -452,7 +452,7 @@ def train(seq: str, iterations, lr, init_cloud, T):
 
 
 def main():
-    torch.manual_seed(42)
+    torch.manual_seed(31)
 
     wandb.login(
         key="45f1e71344c1104de0ce98dc2cf5d9e7557e88ea"
