@@ -351,12 +351,13 @@ def train(seq: str, iterations, lr, init_cloud, T):
     rotations_norm = pos_smol(rotations_norm)
 
     ## Random Training
+
     dataset = []
     for t in range(1, seq_len + 1, 1):
         dataset += [get_dataset(t, md, seq)]
     for i in tqdm(range(iterations)):
         p = i / iterations
-        alpha = 2. / (1. + math.exp(-6 * p)) - 1
+        alpha = p # 2. / (1. + math.exp(-6 * p)) - 1
 
         di = (i % seq_len)# torch.randint(0, len(dataset), (1,))
         si = torch.randint(0, len(dataset[0]), (1,))
