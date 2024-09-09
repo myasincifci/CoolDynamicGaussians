@@ -225,7 +225,7 @@ class MLP(nn.Module):
         )
         self.fc_out = nn.Linear(hid_dim, 7)
 
-        self.emb = nn.Embedding(seq_len, 3)
+        # self.emb = nn.Embedding(seq_len, 3)
 
     def dec2bin(self, x, bits):
         # mask = 2 ** torch.arange(bits).to(x.device, x.dtype)
@@ -331,9 +331,10 @@ def train(seq: str, iterations, lr, init_cloud, T):
     iterations = iterations #200_000
 
     mlp = MLP(100, 128, seq_len, 6).cuda()
+    mlp.load_state_dict(torch.load('model_final.pth'), strict=False)
     # mlp = UNet(100, None, seq_len, None).cuda()
     mlp_optimizer = torch.optim.Adam(params=mlp.parameters(), lr=lr)
-    scheduler = get_linear_warmup_cos_annealing(mlp_optimizer, warmup_iters=15_000, total_iters=iterations)
+    scheduler = get_linear_warmup_cos_annealing(mlp_optimizer, warmup_iters=10_000, total_iters=iterations)
 
     means = params['means']
     rotations = params['rotations']
@@ -357,12 +358,12 @@ def train(seq: str, iterations, lr, init_cloud, T):
         dataset += [get_dataset(t, md, seq)]
     for i in tqdm(range(iterations)):
         p = i / iterations
-        alpha = p # 2. / (1. + math.exp(-6 * p)) - 1
+        alpha = 0.5 # 1. / (1. + math.exp(-10. * (5 * (p % .2)-.5)))
 
         di = (i % seq_len)# torch.randint(0, len(dataset), (1,))
         si = torch.randint(0, len(dataset[0]), (1,))
 
-        t = pos_smol(torch.tensor((di+1)/seq_len).view(1,1).repeat(means_norm.shape[0], 1).cuda())
+        t = pos_smol(torch.tensor((di+1)/149).view(1,1).repeat(means_norm.shape[0], 1).cuda())
 
         if di == 0:
             variables = initialize_per_timestep(params, variables)
@@ -423,7 +424,7 @@ def train(seq: str, iterations, lr, init_cloud, T):
             das = get_dataset(t, md=md, seq=seq)
             X = das[0]
 
-            t = pos_smol(torch.tensor((t+1)/seq_len).view(1,1).repeat(means_norm.shape[0], 1).cuda())
+            t = pos_smol(torch.tensor((t+1)/149).view(1,1).repeat(means_norm.shape[0], 1).cuda())
 
             # delta = mlp(torch.cat((params['means'], params['rotations']), dim=1), torch.tensor(t).cuda())
             delta = mlp(torch.cat((params['means'], params['rotations']), dim=1), torch.cat((means_norm, rotations_norm), dim=1), t)
@@ -459,7 +460,7 @@ def main():
         key="45f1e71344c1104de0ce98dc2cf5d9e7557e88ea"
     )
     wandb.init(
-        project="new-dynamic-gaussians",
+        project="animating-gaussian-splats",
         entity="myasincifci",
 
     )
